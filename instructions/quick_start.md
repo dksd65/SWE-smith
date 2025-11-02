@@ -180,3 +180,18 @@ To simply gather valid bugs into a .json file:
 ```bash
 python -m swesmith.harness.simple_gather logs/run_validation/pandas-dev__pandas.8f359f8e
 ```
+
+## Evaluate predictions on task instances
+Use gold prediction (i.e. reverting the change to original state), should resolve all isntances.
+```bash
+python swesmith/harness/eval.py --dataset_path logs/task_insts/pandas-dev__pandas.8f359f8e.json -p g
+old --run_id sanity
+```
+
+## Generating issue text for task instances
+```bash
+python swesmith/issue_gen/generate.py --dataset "logs/task_insts/pandas-dev__pandas.8f359f8e.json" \
+    --config_file configs/issue_gen/ig_v2.yaml \
+    --workers 2 \
+    --redo_existing
+```

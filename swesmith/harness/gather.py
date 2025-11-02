@@ -32,7 +32,11 @@ import os
 import shutil
 import subprocess
 
+from dotenv import load_dotenv
 from pathlib import Path
+
+# Load environment variables from .env file
+load_dotenv()
 from swebench.harness.constants import (
     FAIL_TO_PASS,
     PASS_TO_PASS,
@@ -99,26 +103,83 @@ def check_if_branch_exists(
     override_branch: bool,
     verbose: bool,
 ):
-    branch_exists = None
-    try:
-        subprocess.run(f"git checkout {subfolder}", cwd=repo_name, **SUBPROCESS_ARGS)
+    branch_exists = False
+    
+    # First check if branch exists locally (using show-ref, more reliable)
+    result = subprocess.run(
+        f"git show-ref --verify --quiet refs/heads/{subfolder}",
+        cwd=repo_name,
+        shell=True,
+        capture_output=True,
+    )
+    branch_exists_locally = result.returncode == 0
+    
+    # Check if branch exists on remote
+    result = subprocess.run(
+        f"git ls-remote --heads origin {subfolder}",
+        cwd=repo_name,
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    branch_exists_remote = result.returncode == 0 and result.stdout.strip()
+    
+    branch_exists = branch_exists_locally or branch_exists_remote
+    
+    if branch_exists:
         if override_branch:
+            # Clean up local branch
+            if branch_exists_locally:
+                try:
+                    # Make sure we're not on the branch we're deleting
+                    # Stash or reset any uncommitted changes first
+                    subprocess.run(
+                        f"git checkout {main_branch}",
+                        cwd=repo_name,
+                        shell=True,
+                        check=False,
+                        capture_output=True,
+                    )
+                    # Force delete local branch
+                    subprocess.run(
+                        f"git branch -D {subfolder}",
+                        cwd=repo_name,
+                        shell=True,
+                        check=False,
+                        capture_output=True,
+                    )
+                except Exception:
+                    pass  # Continue even if cleanup fails
+            
             # Delete the branch remotely
-            subprocess.run(
-                f"git push --delete origin {subfolder}",
-                cwd=repo_name,
-                **SUBPROCESS_ARGS,
-            )
-            if verbose:
-                print(f"[{subfolder}] Overriding existing branch")
+            if branch_exists_remote:
+                try:
+                    subprocess.run(
+                        f"git push --delete origin {subfolder}",
+                        cwd=repo_name,
+                        shell=True,
+                        check=False,
+                        capture_output=True,
+                    )
+                    if verbose:
+                        print(f"[{subfolder}] Overriding existing branch")
+                except Exception:
+                    pass  # Continue even if remote delete fails
+            
             branch_exists = False
         else:
-            branch_exists = True
-        subprocess.run(f"git checkout {main_branch}", cwd=repo_name, **SUBPROCESS_ARGS)
-        subprocess.run(f"git branch -D {subfolder}", cwd=repo_name, **SUBPROCESS_ARGS)
-    except Exception:
-        branch_exists = False
-        pass
+            # Ensure we're on main branch before returning
+            try:
+                subprocess.run(
+                    f"git checkout {main_branch}",
+                    cwd=repo_name,
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                )
+            except Exception:
+                pass
+    
     return branch_exists
 
 
@@ -276,6 +337,39 @@ def _main(
             print(f"[{subfolder}] Bug patch applied successfully")
 
         # Create a branch, check it out, commit, push the branch, and cleanup
+        # First ensure we're on main branch and clean
+        subprocess.run(
+            f"git checkout {main_branch}",
+            cwd=rp.repo_name,
+            shell=True,
+            check=False,
+            capture_output=True,
+        )
+        subprocess.run(
+            "git reset --hard",
+            cwd=rp.repo_name,
+            shell=True,
+            check=False,
+            capture_output=True,
+        )
+        
+        # Check if branch already exists locally (shouldn't happen, but just in case)
+        result = subprocess.run(
+            f"git show-ref --verify --quiet refs/heads/{subfolder}",
+            cwd=rp.repo_name,
+            shell=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            # Branch exists locally, delete it first
+            subprocess.run(
+                f"git branch -D {subfolder}",
+                cwd=rp.repo_name,
+                shell=True,
+                check=False,
+                capture_output=True,
+            )
+        
         cmds = [
             "git config user.email 'swesmith@swesmith.ai'",
             "git config user.name 'swesmith'",
@@ -314,8 +408,47 @@ def _main(
         elif verbose:
             print(f"[{subfolder}] No test files to remove")
 
+        # Push the branch - this is critical, so we check for errors
+        # Use GITHUB_TOKEN from environment if available
+        github_token = os.getenv("GITHUB_TOKEN")
+        
+        if github_token:
+            # Push using token embedded in URL
+            push_url = f"https://{github_token}@github.com/{rp.mirror_name}.git"
+            push_cmd = f"git push {push_url} {subfolder}"
+            if verbose:
+                print(f"[{subfolder}] Pushing with token authentication")
+        else:
+            # Fall back to regular push (will use SSH or existing credentials)
+            push_cmd = f"git push origin {subfolder}"
+            if verbose:
+                print(f"[{subfolder}] Pushing (no GITHUB_TOKEN found, using default credentials)")
+        
+        try:
+            push_result = subprocess.run(
+                push_cmd,
+                cwd=rp.repo_name,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            if verbose:
+                print(f"[{subfolder}] Pushed branch to origin")
+        except subprocess.CalledProcessError as e:
+            error_msg = (
+                f"[{subfolder}] Failed to push branch to GitHub. "
+                f"Error: {e.stderr.strip() if e.stderr else str(e)}\n"
+                f"Make sure you have:\n"
+                f"1. GitHub authentication set up (GITHUB_TOKEN in .env file or SSH keys)\n"
+                f"2. Write access to the repository\n"
+                f"The branch was created locally but NOT pushed to GitHub."
+            )
+            print(error_msg)
+            raise Exception(error_msg) from e
+        
+        # Cleanup: switch back to main and delete local branch
         cmds = [
-            f"git push origin {subfolder}",
             f"git checkout {main_branch}",
             "git reset --hard",
             f"git branch -D {subfolder}",

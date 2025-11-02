@@ -69,28 +69,32 @@ def _apply_patch(
     Apply a patch to a container's codebase
     """
     apply_succeeded = False
-    for git_apply_cmd in GIT_APPLY_CMDS:
-        # Because gold patches = bug patches, so fix = revert
-        git_apply_cmd = (
-            f"{git_apply_cmd} {DOCKER_PATCH}"
-            if not is_gold
-            else f"{git_apply_cmd} --reverse {DOCKER_PATCH}"
-        )
-        val = container.exec_run(
-            git_apply_cmd, workdir=DOCKER_WORKDIR, user=DOCKER_USER
-        )
-        if val.exit_code == 0:
-            apply_succeeded = True
-            logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
-            break
-        logger.info(
-            f"Failed to apply patch to container with {git_apply_cmd}.\n"
-            + f"Error Message: {val.output.decode(UTF8)}\nTrying again..."
-        )
-    if not apply_succeeded:
-        apply_failed_msg = f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}"
-        logger.info(apply_failed_msg)
-        raise EvaluationError(instance_id, apply_failed_msg, logger)
+    
+    if is_gold:
+        # For gold evaluation: we already checked out to HEAD~1^ (clean state before bug)
+        # So we don't need to apply any patch - we're already at the fixed state!
+        # The bug patch would take us from clean -> buggy, but we're at clean, so no-op
+        apply_succeeded = True
+        logger.info("Gold evaluation: Already at clean state (before bug), no patch application needed")
+    else:
+        # Normal patch application (forward)
+        for git_apply_cmd in GIT_APPLY_CMDS:
+            git_apply_cmd_full = f"{git_apply_cmd} {DOCKER_PATCH}"
+            val = container.exec_run(
+                git_apply_cmd_full, workdir=DOCKER_WORKDIR, user=DOCKER_USER
+            )
+            if val.exit_code == 0:
+                apply_succeeded = True
+                logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
+                break
+            logger.info(
+                f"Failed to apply patch to container with {git_apply_cmd_full}.\n"
+                + f"Error Message: {val.output.decode(UTF8)}\nTrying again..."
+            )
+        if not apply_succeeded:
+            apply_failed_msg = f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}"
+            logger.info(apply_failed_msg)
+            raise EvaluationError(instance_id, apply_failed_msg, logger)
 
 
 def run_patch_in_container(
@@ -160,30 +164,47 @@ def run_patch_in_container(
                 return logger, False
             if is_eval:
                 # NOTE: Key assumption we make is that each branch has two commits
-                # 1. Bug commit
+                # 1. Bug commit (applies bug patch)
                 # 2. F2P Test File(s) removal commit (on top of 1).
-                # The `HEAD~1` corresponds to reverting the branch to (1), which
-                # effectively brings the tests back into the codebase.
-                val = container.exec_run(
-                    "git checkout HEAD~1", workdir=DOCKER_WORKDIR, user=DOCKER_USER
-                )
-                if val.exit_code != 0:
-                    logger.info(
-                        f"CHECKOUT TO BUG STAGE FAILED: {val.output.decode(UTF8)}"
+                # For normal eval: checkout HEAD~1 (bug commit) so tests exist, then apply fix patch
+                # For gold eval: checkout HEAD~1^ (parent of bug = clean) since gold reverses bug patch
+                if is_gold:
+                    # Gold evaluation: we'll reverse the bug patch, so go to clean state (before bug)
+                    val = container.exec_run(
+                        "git checkout HEAD~1^", workdir=DOCKER_WORKDIR, user=DOCKER_USER
                     )
-                    return logger, False
+                    if val.exit_code != 0:
+                        logger.info(
+                            f"CHECKOUT TO CLEAN STAGE (for gold) FAILED: {val.output.decode(UTF8)}"
+                        )
+                        return logger, False
+                    logger.info("Checked out to clean state (parent of bug commit) for gold evaluation")
+                else:
+                    # Normal evaluation: checkout HEAD~1 (bug commit) so tests exist
+                    val = container.exec_run(
+                        "git checkout HEAD~1", workdir=DOCKER_WORKDIR, user=DOCKER_USER
+                    )
+                    if val.exit_code != 0:
+                        logger.info(
+                            f"CHECKOUT TO BUG STAGE FAILED: {val.output.decode(UTF8)}"
+                        )
+                        return logger, False
 
         # If provided, copy patch to container and apply it to codebase
         if patch is not None and len(patch) >= 1:
             logger.info("Applying patch to container...")
 
             # Revert any changes to those files in the container to ensure a clean state
-            changed_files = " ".join([x.path for x in PatchSet(patch)])
-            container.exec_run(
-                f"git checkout -- {changed_files}",
-                workdir=DOCKER_WORKDIR,
-                user=DOCKER_USER,
-            )
+            # For gold evaluation, we're already at HEAD~1 (buggy state), so we need the buggy code
+            # For normal evaluation, we want clean state from the branch
+            if not is_gold:
+                changed_files = " ".join([x.path for x in PatchSet(patch)])
+                container.exec_run(
+                    f"git checkout -- {changed_files}",
+                    workdir=DOCKER_WORKDIR,
+                    user=DOCKER_USER,
+                )
+            # For gold: We're at HEAD~1 which already has the bug, no need to revert
 
             # Apply the patch inside the container
             patch_file = Path(log_dir / "patch.diff")
@@ -193,18 +214,36 @@ def run_patch_in_container(
             _apply_patch(instance_id, container, logger, is_gold)
 
             if is_eval:
-                # For evaluation, removes any changes to test related files.
+                # For evaluation, restore test files that may have been removed during gather
+                # Test files may have been removed from the instance branch, so try to restore from main
                 f2p_files, p2p_files = rp.get_test_files(instance)
-                test_files = " ".join(f2p_files + p2p_files)
-                if test_files:
-                    container.exec_run(
-                        f"git checkout -- {test_files}",
+                test_files_list = list(set(f2p_files + p2p_files))  # Remove duplicates
+                if test_files_list:
+                    test_files = " ".join(test_files_list)
+                    # Try to restore from main branch first, then HEAD as fallback
+                    # We need to run these separately since exec_run doesn't support shell operators
+                    result = container.exec_run(
+                        f"git checkout main -- {test_files}",
                         workdir=DOCKER_WORKDIR,
                         user=DOCKER_USER,
                     )
-                    logger.info(
-                        f"Reverted changes to test files in container: {test_files}"
-                    )
+                    if result.exit_code != 0:
+                        # Fallback to HEAD if main doesn't work
+                        result = container.exec_run(
+                            f"git checkout HEAD -- {test_files}",
+                            workdir=DOCKER_WORKDIR,
+                            user=DOCKER_USER,
+                        )
+                    
+                    if result.exit_code == 0:
+                        logger.info(
+                            f"Restored test files in container: {test_files}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Could not restore test files: {test_files}. "
+                            f"Error: {result.output.decode(UTF8) if result.output else 'Unknown'}"
+                        )
 
         # Copy eval script to container
         eval_file = Path(log_dir / "eval.sh")
