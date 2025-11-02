@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
@@ -53,8 +54,42 @@ def get_valid_report(
     """
     rp = registry.get(instance["repo"])
 
+    # Check if files exist before trying to read them
+    val_pregold_path_obj = Path(val_pregold_path)
+    val_postgold_path_obj = Path(val_postgold_path)
+    
+    if not val_pregold_path_obj.exists():
+        raise FileNotFoundError(
+            f"Pre-gold test output not found: {val_pregold_path}. "
+            "The test run may have failed or timed out."
+        )
+    if not val_postgold_path_obj.exists():
+        raise FileNotFoundError(
+            f"Post-gold (reference) test output not found: {val_postgold_path}. "
+            "The reference test run may have failed or timed out. "
+            "For repos with min_pregold=False, this is a shared reference run that must complete first."
+        )
+
+    # Read full test output file to check for collection errors (they may be outside markers)
+    val_pregold_full = Path(val_pregold_path).read_text()
+    val_postgold_full = Path(val_postgold_path).read_text()
+    
+    # Check for collection errors (tests can't be collected/imported)
+    collection_error_patterns = [
+        r"errors during collection",
+        r"Interrupted:.*errors during collection",
+        r"ERROR.*during collection",
+    ]
+    has_collection_errors = False
+    if val_pregold_full:
+        for pattern in collection_error_patterns:
+            if re.search(pattern, val_pregold_full, re.IGNORECASE):
+                has_collection_errors = True
+                break
+    
     val_pregold_output, found_pregold = read_test_output(val_pregold_path)
     val_postgold_output, found_postgold = read_test_output(val_postgold_path)
+    
     pregold_sm = rp.log_parser(val_pregold_output) if found_pregold else {}
     postgold_sm = rp.log_parser(val_postgold_output) if found_postgold else {}
 
@@ -64,6 +99,10 @@ def get_valid_report(
         FAIL_TO_FAIL: [],
         PASS_TO_FAIL: [],
     }
+    
+    # If collection failed, mark it in the report
+    if has_collection_errors:
+        report["collection_errors"] = True
 
     for test_case in postgold_sm:
         if test_case not in pregold_sm:

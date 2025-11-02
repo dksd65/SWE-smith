@@ -66,14 +66,25 @@ def main(
 
     try:
         # Shallow clone repository at the specified commit
+        # Try HTTPS first (works for public repos), fallback to SSH
         if not os.path.exists(p.repo):
-            subprocess.run(
-                f"git clone git@github.com:{p.owner}/{p.repo}.git",
-                check=True,
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            try:
+                subprocess.run(
+                    f"git clone https://github.com/{p.owner}/{p.repo}.git",
+                    check=True,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError:
+                # Fallback to SSH if HTTPS fails
+                subprocess.run(
+                    f"git clone git@github.com:{p.owner}/{p.repo}.git",
+                    check=True,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         os.chdir(p.repo)
         if commit != "latest":
             subprocess.run(
@@ -105,27 +116,54 @@ def main(
         subprocess.run(f". {install_script}", check=True, shell=True)
         print("> Successfully installed repo")
 
-        # If installation succeeded, export the conda environment + record install script
+        # If installation succeeded, export the pip requirements + record install script
         os.chdir("..")
         p._env_yml.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            f"conda env export -n {ENV_NAME} > {p._env_yml}",
+            f"pip freeze > {p._env_yml}",
             check=True,
             shell=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-        # Edit env.yml such that name of package is excluded from `pip`
+        # Edit requirements.txt: exclude repo package and filter incompatible packages
+        incompatible_packages = [
+            "pyyaml-ft",  # Not available for Python 3.12, only 3.13+
+            "types-certifi",  # May cause issues across versions
+            "types-toml",  # May cause issues across versions
+            "pyarrow",  # Optional dependency; version check fails if pandas version isn't properly generated
+        ]
+        
         with open(p._env_yml, "r") as f:
             lines = f.readlines()
         with open(p._env_yml, "w") as f:
             for line in lines:
+                line_stripped = line.strip()
+                if not line_stripped or line_stripped.startswith("#"):
+                    continue
+                
                 # Exclude the package by both repository name and lowercase package name
-                if line.strip().startswith(f"- {p.repo}==") or line.strip().startswith(
-                    f"- {p.repo.lower()}=="
+                if line_stripped.startswith(f"{p.repo}==") or line_stripped.startswith(
+                    f"{p.repo.lower()}=="
                 ):
                     continue
+                
+                # Exclude known incompatible packages (platform/Python version specific)
+                # Extract package name (everything before ==, @, or whitespace)
+                package_name = line_stripped.split("==")[0].split("@")[0].split()[0].lower().replace("_", "-")
+                
+                # Check if package matches any incompatible package (exact match)
+                should_exclude = False
+                for incompat in incompatible_packages:
+                    incompat_norm = incompat.lower().replace("_", "-")
+                    if package_name == incompat_norm:
+                        should_exclude = True
+                        break
+                
+                if should_exclude:
+                    continue
+                
                 f.write(line)
 
         with open(install_script) as install_f:
@@ -133,19 +171,19 @@ def main(
                 l.strip("\n") for l in install_f.readlines() if len(l.strip()) > 0
             ]
 
-        with open(str(p._env_yml).replace(".yml", ".sh"), "w") as f:
+        with open(str(p._env_yml).replace(".txt", ".sh"), "w") as f:
             f.write(
                 "\n".join(
                     [
                         "#!/bin/bash\n",
-                        f"git clone git@github.com:{p.owner}/{p.repo}.git",
+                        f"git clone https://github.com/{p.owner}/{p.repo}.git",
                         f"git checkout {p.commit}",
                     ]
                     + install_lines
                 )
                 + "\n"
             )
-        print(f"> Exported conda environment to {p._env_yml}")
+        print(f"> Exported pip requirements to {p._env_yml}")
     except Exception as e:
         print(f"> Installation procedure failed: {e}")
     finally:

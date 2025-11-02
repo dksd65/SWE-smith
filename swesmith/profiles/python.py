@@ -31,8 +31,7 @@ class PythonProfile(RepoProfile):
         default_factory=lambda: ["python -m pip install -e ."]
     )
     test_cmd: str = (
-        "source /opt/miniconda3/bin/activate; "
-        f"conda activate {ENV_NAME}; "
+        f"source /venv/{ENV_NAME}/bin/activate; "
         "pytest --disable-warnings --color=no --tb=no --verbose"
     )
     exts: list[str] = field(default_factory=lambda: [".py"])
@@ -43,41 +42,6 @@ class PythonProfile(RepoProfile):
         )
         _helper = lambda tests: sorted(list(set([x.split("::", 1)[0] for x in tests])))
         return _helper(instance[FAIL_TO_PASS]), _helper(instance[PASS_TO_PASS])
-
-    def build_image(self):
-        BASE_IMAGE_KEY = "jyangballin/swesmith.x86_64"
-        HEREDOC_DELIMITER = "EOF_59812759871"
-        PATH_TO_REQS = "swesmith_environment.yml"
-
-        client = docker.from_env()
-        with open(self._env_yml) as f:
-            reqs = f.read()
-
-        setup_commands = [
-            "#!/bin/bash",
-            "set -euxo pipefail",
-            f"git clone -o origin https://github.com/{self.mirror_name} /{ENV_NAME}",
-            f"cd /{ENV_NAME}",
-            "source /opt/miniconda3/bin/activate",
-            f"cat <<'{HEREDOC_DELIMITER}' > {PATH_TO_REQS}\n{reqs}\n{HEREDOC_DELIMITER}",
-            f"conda env create --file {PATH_TO_REQS}",
-            f"conda activate {ENV_NAME} && conda install python={self.python_version} -y",
-            f"rm {PATH_TO_REQS}",
-            f"conda activate {ENV_NAME}",
-            'echo "Current environment: $CONDA_DEFAULT_ENV"',
-        ] + self.install_cmds
-        dockerfile = get_dockerfile_env(
-            self.pltf, self.arch, "py", base_image_key=BASE_IMAGE_KEY
-        )
-
-        build_image_sweb(
-            image_name=self.image_name,
-            setup_scripts={"setup_env.sh": "\n".join(setup_commands) + "\n"},
-            dockerfile=dockerfile,
-            platform=self.pltf,
-            client=client,
-            build_dir=LOG_DIR_ENV / self.repo_name,
-        )
 
     def log_parser(self, log: str) -> dict[str, str]:
         """Parser for test logs generated with PyTest framework"""
@@ -92,7 +56,70 @@ class PythonProfile(RepoProfile):
 
     @property
     def _env_yml(self) -> Path:
-        return LOG_DIR_ENV / self.repo_name / f"sweenv_{self.repo_name}.yml"
+        return LOG_DIR_ENV / self.repo_name / f"requirements_{self.repo_name}.txt"
+
+    def build_image(self):
+        """Build Docker image using venv instead of conda"""
+        BASE_IMAGE_KEY = "jyangballin/swesmith.x86_64"
+        HEREDOC_DELIMITER = "EOF_59812759871"
+        PATH_TO_REQS = "requirements.txt"
+        
+        client = docker.from_env()
+        with open(self._env_yml) as f:
+            reqs = f.read()
+        
+        setup_commands = [
+            "#!/bin/bash",
+            "set -euo pipefail",
+            # Clone from mirror if it exists, otherwise fallback to original repo
+            # This handles the case where mirror creation failed
+            f"if git ls-remote --exit-code https://github.com/{self.mirror_name}.git &>/dev/null; then",
+            f"  # Clone from mirror (mirror already contains code at the correct commit state)",
+            f"  git clone -o origin https://github.com/{self.mirror_name}.git /{ENV_NAME}",
+            f"  cd /{ENV_NAME}",
+            f"  # Mirror has no git history/tags (it's a fresh repo with just the code).",
+            f"  # We need to add upstream remote to fetch tags for versioneer to work.",
+            f"  git remote add upstream https://github.com/{self.owner}/{self.repo}.git || true",
+            f"  # Fetch tags from upstream for version generation (versioneer needs them)",
+            f"  git fetch upstream --tags",
+            f"  # Mirror code is already at correct state, no checkout needed",
+            f"else",
+            f"  echo 'Warning: Mirror not found, cloning from original repo'; git clone -o origin https://github.com/{self.owner}/{self.repo}.git /{ENV_NAME}",
+            f"  cd /{ENV_NAME} && git checkout {self.commit}",
+            f"fi",
+            f"cd /{ENV_NAME}",
+            # Create virtual environment
+            f"python3 -m venv /venv/{ENV_NAME}",
+            f"source /venv/{ENV_NAME}/bin/activate",
+            # Install requirements (filtered for compatibility with Python 3.12)
+            f"pip install --upgrade pip",
+            f"cat <<'{HEREDOC_DELIMITER}' > {PATH_TO_REQS}\n{reqs}\n{HEREDOC_DELIMITER}",
+            # Install packages - incompatible ones have been filtered out during export
+            f"pip install -r {PATH_TO_REQS}",
+            f"rm {PATH_TO_REQS}",
+        ] + self.install_cmds
+        
+        # Force x86_64 platform for compatibility with base image
+        # (base image is x86_64 only)
+        build_platform = "linux/x86_64"
+        build_arch = "x86_64"
+        
+        dockerfile = get_dockerfile_env(
+            build_platform, build_arch, "py", base_image_key=BASE_IMAGE_KEY
+        )
+        # Override .bashrc to activate venv instead of conda
+        # (get_dockerfile_env writes .bashrc to activate conda, but we're using venv)
+        # Append this AFTER the Dockerfile writes .bashrc
+        dockerfile += f'\n# Override .bashrc to activate venv instead of conda\nRUN echo "source /venv/{ENV_NAME}/bin/activate" > /root/.bashrc\n'
+        
+        build_image_sweb(
+            image_name=self.image_name,
+            setup_scripts={"setup_env.sh": "\n".join(setup_commands) + "\n"},
+            dockerfile=dockerfile,
+            platform=build_platform,
+            client=client,
+            build_dir=LOG_DIR_ENV / self.repo_name,
+        )
 
 
 ### MARK: Repository Profile Classes ###
@@ -1314,6 +1341,24 @@ class Conan86f29e13(PythonProfile):
         ]
     )
     min_testing: bool = True
+
+
+@dataclass
+class Pandas8f359f8e(PythonProfile):
+    owner: str = "pandas-dev"
+    repo: str = "pandas"
+    commit: str = "8f359f8e"  # Short commit hash - will be resolved to full hash
+    install_cmds: list = field(
+        default_factory=lambda: [
+            # Build backend and tools (required for --no-build-isolation)
+            "pip install meson-python meson ninja 'versioneer[toml]' cython numpy",
+            # Remove pyarrow if present (optional dependency causing version check issues)
+            "pip uninstall -y pyarrow || true",
+            "python -m pip install -ve . --no-build-isolation -Ceditable-verbose=true",
+            # Install test dependencies (hypothesis is required by conftest.py)
+            "pip install pytest 'hypothesis>=6.116.0' pytest-xdist",
+        ]
+    )
 
 
 @dataclass

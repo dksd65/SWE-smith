@@ -102,6 +102,7 @@ def run_patch_in_container(
     commit: str | None = None,
     f2p_only: bool = False,
     is_gold: bool = False,
+    test_filter: str | None = None,
 ) -> tuple[Logger, bool] | None:
     """
     Run a patch in a container. The general logical flow is as follows:
@@ -208,6 +209,9 @@ def run_patch_in_container(
         # Copy eval script to container
         eval_file = Path(log_dir / "eval.sh")
         test_command, _ = rp.get_test_cmd(instance, f2p_only=f2p_only)
+        # Append test filter if provided (e.g., pytest path or -k pattern)
+        if test_filter:
+            test_command += f" {test_filter}"
         eval_file.write_text(
             "\n".join(
                 [

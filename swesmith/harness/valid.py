@@ -29,18 +29,24 @@ from swesmith.constants import (
     LOG_DIR_RUN_VALIDATION,
 )
 from swesmith.harness.grading import get_valid_report
-from swesmith.harness.utils import run_patch_in_container, run_threadpool
+from swesmith.harness.utils import (
+    run_patch_in_container,
+    run_threadpool,
+    matches_instance_filter,
+)
 from swesmith.profiles import registry
 
 
 def print_report(log_dir: Path) -> None:
-    time_outs, f2p_none, f2p_some, other = 0, 0, 0, 0
+    time_outs, f2p_none, f2p_some, collection_errors, other = 0, 0, 0, 0, 0
     for folder in os.listdir(log_dir):
         if LOG_REPORT in os.listdir(log_dir / folder):
             with open(log_dir / folder / LOG_REPORT, "r") as f:
                 report = json.load(f)
             if KEY_TIMED_OUT in report:
                 time_outs += 1
+            elif report.get("collection_errors", False):
+                collection_errors += 1
             elif len(report[FAIL_TO_PASS]) > 0:
                 f2p_some += 1
             elif len(report[FAIL_TO_PASS]) == 0:
@@ -49,11 +55,12 @@ def print_report(log_dir: Path) -> None:
                 other += 1
     print(f"Total instances: {len(os.listdir(log_dir))}")
     print(f"- Timed out: {time_outs}")
+    print(f"- Collection errors (too broken): {collection_errors}")
     print(f"- Fail to pass: 0 ({f2p_none}); 1+ ({f2p_some})")
     print(f"- Other: {other}")
 
 
-def run_validation(instance: dict) -> dict:
+def run_validation(instance: dict, test_filter: str | None = None) -> dict:
     """
     Run per-instance validation. Steps are generally:
     1. Run the patch on the instance.
@@ -78,6 +85,7 @@ def run_validation(instance: dict) -> dict:
             instance["repo"],
             LOG_DIR_RUN_VALIDATION,
             rp.timeout,
+            test_filter=test_filter,
         )
         close_logger(logger)
         if timed_out:
@@ -105,6 +113,7 @@ def run_validation(instance: dict) -> dict:
         LOG_DIR_RUN_VALIDATION,
         rp.timeout,
         patch=instance[KEY_PATCH],
+        test_filter=test_filter,
     )
 
     if timed_out:
@@ -141,9 +150,14 @@ def run_validation(instance: dict) -> dict:
 
     # Return result based on the report
     close_logger(logger)
-    if len(report.get(FAIL_TO_PASS, [])) == 0:
+    if report.get("collection_errors", False):
+        # Tests couldn't be collected/imported - bug too severe
+        return {"status": "collection_error"}
+    elif len(report.get(FAIL_TO_PASS, [])) == 0:
+        # Tests ran but none failed - valid but not useful
         return {"status": "0_f2p"}
     else:
+        # Tests ran and some failed - valid and useful
         return {"status": "1+_f2p"}
 
 
@@ -151,6 +165,8 @@ def main(
     bug_patches: str,
     workers: int,
     redo_existing: bool = False,
+    instance_ids: list | None = None,
+    test_filter: str | None = None,
 ) -> None:
     # Bug patch should be a dict that looks like this:
     # {
@@ -168,6 +184,16 @@ def main(
         }
         for x in bug_patches
     ]
+    
+    # Filter by instance IDs if provided
+    if instance_ids is not None:
+        bug_patches = [
+            x
+            for x in bug_patches
+            if matches_instance_filter(x[KEY_INSTANCE_ID], instance_ids)
+        ]
+        print(f"Filtered to {len(bug_patches)} instances matching filter.")
+    
     print(f"Found {len(bug_patches)} candidate patches.")
 
     completed = []
@@ -196,18 +222,27 @@ def main(
 
     # Run validation
     payloads = list()
+    # Initialize log_dir_parent from first repo if available
+    log_dir_parent = None
+    if len(repo_to_bug_patches) > 0:
+        first_repo = next(iter(repo_to_bug_patches.keys()))
+        log_dir_parent = LOG_DIR_RUN_VALIDATION / first_repo
+    
     for repo, repo_bug_patches in repo_to_bug_patches.items():
+        
         rp = registry.get(repo)
         ref_inst = f"{rp.repo_name}{REF_SUFFIX}"
         ref_dir = LOG_DIR_RUN_VALIDATION / repo / ref_inst
-        if not rp.min_pregold and not os.path.exists(ref_dir):
+        ref_test_output = ref_dir / LOG_TEST_OUTPUT
+        if not rp.min_pregold and not ref_test_output.exists():
             # Run pytest for each repo/commit to get pre-gold behavior.
-            print(f"Running pre-gold for {repo}...")
+            print(f"Running pre-gold (reference) for {repo}...")
             logger, timed_out = run_patch_in_container(
                 {KEY_INSTANCE_ID: ref_inst},
                 repo,
                 LOG_DIR_RUN_VALIDATION,
                 rp.timeout_ref,
+                test_filter=test_filter,
             )
             close_logger(logger)
             if timed_out:
@@ -215,7 +250,14 @@ def main(
                 print(
                     f"Timed out for {repo}, not running validation. (Increase --timeout?)"
                 )
-                shutil.rmtree(ref_dir)
+                shutil.rmtree(ref_dir, ignore_errors=True)
+                continue
+            # Verify the reference test output was created
+            if not ref_test_output.exists():
+                print(
+                    f"Warning: Reference test output not created for {repo}. Skipping validation."
+                )
+                shutil.rmtree(ref_dir, ignore_errors=True)
                 continue
 
         # Add payloads
@@ -225,18 +267,19 @@ def main(
     # Check if we have any payloads to process
     if len(payloads) == 0:
         print("No patches to run.")
-        print_report(log_dir_parent)
+        if log_dir_parent is not None and log_dir_parent.exists():
+            print_report(log_dir_parent)
         return
 
     # Initialize progress bar and stats
-    stats = {"fail": 0, "timeout": 0, "0_f2p": 0, "1+_f2p": 0}
+    stats = {"fail": 0, "timeout": 0, "0_f2p": 0, "1+_f2p": 0, "collection_error": 0}
     pbar = tqdm(total=len(payloads), desc="Validation", postfix=stats)
     lock = threading.Lock()
 
     # Create a wrapper function for threadpool that updates progress bar
     def run_validation_with_progress(*args):
         instance = args[0] if args else {}
-        result = run_validation(instance)
+        result = run_validation(instance, test_filter=test_filter)
         with lock:
             stats[result["status"]] += 1
             pbar.set_postfix(stats)
@@ -268,6 +311,19 @@ if __name__ == "__main__":
         "--redo_existing",
         action="store_true",
         help="Redo completed validation instances.",
+    )
+    parser.add_argument(
+        "-i",
+        "--instance_ids",
+        type=str,
+        help="Instance IDs to validate (supports exact matches and glob patterns like 'repo__name.*')",
+        nargs="+",
+    )
+    parser.add_argument(
+        "--test_filter",
+        type=str,
+        help="Filter tests to run (e.g., 'pandas/tests/arrays/test_timedeltas.py' or '-k timedelta' for pytest patterns)",
+        default=None,
     )
     args = parser.parse_args()
     main(**vars(args))

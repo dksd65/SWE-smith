@@ -14,18 +14,28 @@ from tqdm import tqdm
 from swesmith.profiles import registry
 
 
-def build_profile_image(profile, push=False):
+def build_profile_image(profile, push=False, skip_mirror=False):
     """
     Build a Docker image for a specific profile.
 
     Args:
         profile: A RepoProfile instance
+        push: Whether to push the image after building
+        skip_mirror: Skip mirror creation (useful if mirror isn't needed or org doesn't exist)
 
     Returns:
         tuple: (profile_name, success: bool, error_message: str)
     """
     try:
-        profile.create_mirror()
+        # Try to create mirror, but continue if it fails (mirror may not be needed)
+        if not skip_mirror:
+            try:
+                profile.create_mirror()
+            except Exception as mirror_error:
+                # If mirror creation fails, log but continue (build_image doesn't need mirror)
+                print(f"Warning: Mirror creation failed for {profile.image_name}: {mirror_error}")
+                print("Continuing with image build (mirror not required for venv-based builds)...")
+        
         profile.build_image()
         if push:
             profile.push_image()
@@ -35,7 +45,7 @@ def build_profile_image(profile, push=False):
         return (profile.image_name, False, error_msg)
 
 
-def build_all_images(workers=4, profile_filter=None, proceed=False, push=False):
+def build_all_images(workers=4, profile_filter=None, proceed=False, push=False, skip_mirror=False):
     """
     Build Docker images for all registered profiles in parallel.
 
@@ -99,7 +109,7 @@ def build_all_images(workers=4, profile_filter=None, proceed=False, push=False):
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all build tasks
             future_to_profile = {
-                executor.submit(build_profile_image, profile, push): profile
+                executor.submit(build_profile_image, profile, push, skip_mirror): profile
                 for profile in profiles_to_build
             }
 
@@ -152,6 +162,11 @@ def main():
         help="Push built images to Docker Hub after building (default: False)",
     )
     parser.add_argument(
+        "--skip-mirror",
+        action="store_true",
+        help="Skip GitHub mirror creation (useful if org doesn't exist or mirror not needed)",
+    )
+    parser.add_argument(
         "--list-envs", action="store_true", help="List all available profiles and exit"
     )
 
@@ -168,6 +183,7 @@ def main():
         profile_filter=args.profiles,
         proceed=args.proceed,
         push=args.push,
+        skip_mirror=args.skip_mirror,
     )
 
     if failed:

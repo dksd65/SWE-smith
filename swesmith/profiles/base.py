@@ -191,11 +191,20 @@ class RepoProfile(ABC, metaclass=SingletonMeta):
             return
         if self.repo_name in os.listdir():
             shutil.rmtree(self.repo_name)
-        self.api.repos.create_in_org(self.org_gh, self.repo_name)
+        
+        # Check if org_gh is an organization or user
+        # Try to create in org first, fallback to user repo creation
+        try:
+            # Try organization endpoint first
+            self.api.repos.create_in_org(self.org_gh, self.repo_name)
+        except Exception:
+            # If that fails, it's likely a user account - use user endpoint
+            # For user repos, create_for_authenticated_user creates in the authenticated user's account
+            self.api.repos.create_for_authenticated_user(name=self.repo_name, private=False)
 
-        # Clone the repository
+        # Clone the repository (use HTTPS for public repos, no SSH keys needed)
         subprocess.run(
-            f"git clone git@github.com:{self.owner}/{self.repo}.git {self.repo_name}",
+            f"git clone https://github.com/{self.owner}/{self.repo}.git {self.repo_name}",
             shell=True,
             check=True,
             stdout=subprocess.DEVNULL,
@@ -224,8 +233,9 @@ class RepoProfile(ABC, metaclass=SingletonMeta):
                 "git add .",
                 "git commit --no-gpg-sign -m 'Initial commit'",
                 "git branch -M main",
-                f"git remote add origin git@github.com:{self.mirror_name}.git",
-                "git push -u origin main",
+                f"git remote add origin https://github.com/{self.mirror_name}.git",
+                # Push using HTTPS with token embedded in URL
+                f'git push -u https://${{GITHUB_TOKEN}}@github.com/{self.mirror_name}.git main',
             ]
         )
 
@@ -255,18 +265,34 @@ class RepoProfile(ABC, metaclass=SingletonMeta):
             )
         dest = self.repo_name if not dest else dest
         if not os.path.exists(dest):
-            clone_cmd = (
+            # Try HTTPS first (works for public repos), fallback to SSH
+            clone_cmd_https = (
+                f"git clone https://github.com/{self.mirror_name}.git"
+                if dest is None
+                else f"git clone https://github.com/{self.mirror_name}.git {dest}"
+            )
+            clone_cmd_ssh = (
                 f"git clone git@github.com:{self.mirror_name}.git"
                 if dest is None
                 else f"git clone git@github.com:{self.mirror_name}.git {dest}"
             )
-            subprocess.run(
-                clone_cmd,
-                check=True,
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            try:
+                subprocess.run(
+                    clone_cmd_https,
+                    check=True,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError:
+                # Fallback to SSH if HTTPS fails
+                subprocess.run(
+                    clone_cmd_ssh,
+                    check=True,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             return dest, True
         else:
             return dest, False
