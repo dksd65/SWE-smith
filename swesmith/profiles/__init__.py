@@ -6,6 +6,7 @@ and provides a global registry for accessing all profiles.
 """
 
 from .base import RepoProfile, registry
+from .custom import CustomProfile
 
 # Auto-import all profile modules to populate the registry
 from . import c
@@ -17,5 +18,6 @@ from . import php
 from . import python
 from . import golang
 from . import rust
+from . import lua
 
-__all__ = ["RepoProfile", "registry"]
+__all__ = ["RepoProfile", "CustomProfile", "registry"]

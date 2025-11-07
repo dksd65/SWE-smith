@@ -375,6 +375,7 @@ def _main(
             "git config user.name 'swesmith'",
             "git config commit.gpgsign false",
             f"git checkout -b {subfolder}",
+            f"git apply ../{path_patch}",  # Reapply the patch on the new branch
             "git add .",
             "git commit --no-gpg-sign -m 'Bug Patch'",
         ]

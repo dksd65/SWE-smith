@@ -47,6 +47,7 @@ dependencies = [
     "tree-sitter-java",
     "tree-sitter-ruby",
     "tree-sitter-rust",
+    "tree-sitter-lua",
     "unidiff",
     "textual",
     "tree-sitter-php>=0.23.11",

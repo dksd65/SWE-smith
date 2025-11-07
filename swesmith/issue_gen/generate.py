@@ -274,7 +274,8 @@ class IssueGen:
             with open(output_file, "w") as f_:
                 json.dump(metadata, f_, indent=4)
         else:
-            # If messages already exist, get repos_to_remove from existing metadata
+            # If messages already exist, get them from metadata and repos_to_remove
+            messages = metadata["messages"]
             _, repos_to_remove = self.get_test_functions(instance_curr)
 
         # Generate n_instructions completions containing problem statements
@@ -372,6 +373,32 @@ class IssueGen:
                                 all_repos_to_remove.update(result["repos_to_remove"])
                         pbar.set_postfix(stats, refresh=True)
                         pbar.update(1)
+
+        # Update dataset with generated problem statements
+        logger.info("Updating dataset with generated problem statements...")
+        for instance in self.instances:
+            instance_id = instance[KEY_INSTANCE_ID]
+            output_file = self.issue_gen_logs_dir / f"{instance_id}.json"
+            
+            if output_file.exists():
+                with open(output_file) as f:
+                    metadata = json.load(f)
+                
+                # Get the first problem statement from responses
+                if "responses" in metadata and metadata["responses"]:
+                    # Get responses for the current model (or any model if current not found)
+                    responses = metadata["responses"].get(self.model)
+                    if not responses and metadata["responses"]:
+                        # Fallback to first available model's responses
+                        responses = next(iter(metadata["responses"].values()))
+                    
+                    if responses and len(responses) > 0:
+                        instance["problem_statement"] = responses[0]
+        
+        # Write updated dataset back to file
+        with open(self.dataset_path, "w") as f:
+            json.dump(self.instances, f, indent=4)
+        logger.info(f"Updated dataset saved to {self.dataset_path}")
 
         # Cleanup cloned repositories
         self._cleanup_repos(all_repos_to_remove)

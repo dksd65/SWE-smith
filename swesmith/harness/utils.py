@@ -141,15 +141,26 @@ def run_patch_in_container(
 
         # Start docker container
         rp.pull_image()
-        container = client.containers.create(
-            image=rp.image_name,
-            name=container_name,
-            user=DOCKER_USER,
-            detach=True,
-            command="tail -f /dev/null",
-            platform="linux/x86_64",
-            mem_limit="10g",
-        )
+        # Auto-detect platform from image name (e.g., swesmith.arm64.* or swesmith.amd64.*)
+        # If not specified, Docker will use the native platform
+        platform = None
+        if ".arm64." in rp.image_name:
+            platform = "linux/arm64"
+        elif ".amd64." in rp.image_name or ".x86_64." in rp.image_name:
+            platform = "linux/amd64"
+        
+        container_create_kwargs = {
+            "image": rp.image_name,
+            "name": container_name,
+            "user": DOCKER_USER,
+            "detach": True,
+            "command": "tail -f /dev/null",
+            "mem_limit": "10g",
+        }
+        if platform:
+            container_create_kwargs["platform"] = platform
+        
+        container = client.containers.create(**container_create_kwargs)
         container.start()
 
         # If provided, checkout commit in container

@@ -4,6 +4,7 @@ from swesmith.bug_gen.adapters.c_sharp import get_entities_from_file_c_sharp
 from swesmith.bug_gen.adapters.golang import get_entities_from_file_go
 from swesmith.bug_gen.adapters.java import get_entities_from_file_java
 from swesmith.bug_gen.adapters.javascript import get_entities_from_file_js
+from swesmith.bug_gen.adapters.lua import get_entities_from_file_lua
 from swesmith.bug_gen.adapters.php import get_entities_from_file_php
 from swesmith.bug_gen.adapters.python import get_entities_from_file_py
 from swesmith.bug_gen.adapters.ruby import get_entities_from_file_rb
@@ -16,6 +17,7 @@ get_entities_from_file = {
     ".go": get_entities_from_file_go,
     ".java": get_entities_from_file_java,
     ".js": get_entities_from_file_js,
+    ".lua": get_entities_from_file_lua,
     ".php": get_entities_from_file_php,
     ".py": get_entities_from_file_py,
     ".rb": get_entities_from_file_rb,

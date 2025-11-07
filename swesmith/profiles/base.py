@@ -547,11 +547,11 @@ class Registry(UserDict):
         # Skip base types
         if profile_class.__name__ in {
             "RepoProfile",
+            "CustomProfile",
             "PythonProfile",
             "GoProfile",
             "RustProfile",
         }:
-            # TODO: Update for new languages
             return
         # Create temporary instance to get properties
         p = profile_class()
@@ -559,8 +559,18 @@ class Registry(UserDict):
         self.data[p.mirror_name] = profile_class
 
     def get(self, key: str) -> RepoProfile:
-        """Get a profile class by mirror name or repo name."""
+        """Get a profile class by mirror name or repo name (case-insensitive)."""
+        # Try exact match first
         cls = self.data.get(key)
+        
+        # If no exact match, try case-insensitive match
+        if cls is None:
+            key_lower = key.lower()
+            for registered_key, registered_cls in self.data.items():
+                if registered_key.lower() == key_lower:
+                    cls = registered_cls
+                    break
+        
         if cls is None:
             raise KeyError(f"No profile registered for key: {key}")
         profile = cls()
